@@ -18,6 +18,7 @@ main
 *.stackdump
 *.tgz
 *.bmp
+
 # Visual debugger configurations
 .vscode/
 .vs/
