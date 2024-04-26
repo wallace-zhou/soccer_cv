@@ -2,11 +2,65 @@ from ultralytics import YOLO
 import cv2
 import torch
 import numpy as np
+import pandas as pd
+from PIL import Image
+import skimage
+
+def find_color(player_box, player, color_list_lab, palette_list, frame):
+    box = player_box[player]                   
+    obj_img = frame[int(box[1]):int(box[3]), int(box[0]):int(box[2])] 
+    width, height = obj_img.shape[1], obj_img.shape[0]
+    #shrink the box to incorporate less of thd grass
+    x1 = np.max([(width // 2) - (width // 6), 1])
+    x2 = (width // 2) + (width // 6)
+    y1 = np.max([(height // 3) - (height // 6), 1])
+    y2 = (height // 3) + (height // 6)
+    center_filter = obj_img[y1:y2, x1:x2]
+    pil_img = Image.fromarray(np.uint8(center_filter))  
+    #reduce the image size to just that of the small box
+    reduced = pil_img.convert("P", palette=Image.Palette.WEB)
+    #find the colors of the image
+    palette = reduced.getpalette()                     
+    palette = [palette[3 * n:3 * n + 3] for n in range(256)]      
+    color_count = [(n, palette[m]) for n, m in reduced.getcolors()]                
+    RGB_df = pd.DataFrame(color_count, columns = ['cnt', 'RGB']).sort_values(
+                                                by = 'cnt', ascending = False).iloc[
+                                                (0,5)[0]:(0,5)[1], :]
+    palette = list(RGB_df.RGB) 
+                
+    palette_list.append(palette)
+    players_distance_features = []
+    #iterate through each palette in the lists of palettes
+    for palette in palette_list:
+        palette_distance = []
+        palette_lab = [skimage.color.rgb2lab([i/255 for i in color]) for color in palette]
+        #iterate through each of the folors in thre paleette list
+        for color in palette_lab:
+            distance_list = []
+            #iterate thtouhg each team color to find the color with the least distacne
+            for c in color_list_lab:
+                distance = skimage.color.deltaE_cie76(color, c)                             
+                distance_list.append(distance)                                              
+            palette_distance.append(distance_list)                                          
+        players_distance_features.append(palette_distance)                
+    players_teams_list = 0
+    
+    for dist in players_distance_features:
+        vote = []
+        for dist_list in dist:
+            team_idx = dist_list.index(min(dist_list)) // 2                   
+            vote.append(team_idx)                                              
+        players_teams_list = (max(vote, key=vote.count))
+    return players_teams_list
 
 def transform(video_path,graph_path,transform_kp,device):
     model_p = YOLO("models/Yolo8LP/weights/best.pt")
     model_f = YOLO("models/Yolo8MF/weights/best.pt")
     cap = cv2.VideoCapture(video_path)
+    prev_ball_x = 0
+    prev_ball_y = 0
+    frames_since_update = 0
+    speed = 0
     while cap.isOpened():
         success, frame = cap.read()
         if success:
@@ -20,7 +74,7 @@ def transform(video_path,graph_path,transform_kp,device):
             image_kp = field_result.boxes.xyxy.cpu().numpy()
             image_kp = np.mean(image_kp.reshape(-1, 2, 2), axis=1)
             image_kp = image_kp.astype(np.int16)
-            homography, _ = cv2.findHomography(image_kp, transform_kp_f)
+            homography, _ = cv2.findHomography(image_kp, transform_kp_f, cv2.RANSAC, 8.0)
 
             player_result = model_p.track(frame,persist = True)
             player_result = player_result[0]
@@ -34,15 +88,41 @@ def transform(video_path,graph_path,transform_kp,device):
             transformed_player_loc /= transformed_player_loc[:, 2][:, np.newaxis]
             graph = cv2.imread(graph_path)
     
-    # Define colors for each class
-            colors = [(255, 0, 0), (0, 0, 0), (255, 255, 255)]
+            # Define colors for each class
+            cls_colors = [(255, 0, 0), (0, 0, 0), (255, 255, 255)]
+            colors = {"Chelsea":[(41,71,138), (220,98,88)],
+                        "Man City":[(144,200,255), (188,199,3)] #(Players kit color, GK kit color)                
+                    }
+            colors_list = colors["Chelsea"] + colors["Man City"]
+            color_list_lab = [skimage.color.rgb2lab([i/255 for i in c]) for c in colors_list] 
+            color_array = [(138,71,41), (255,200,144)]
+            palette_list = []                                                                
+            count = 0
+    
             for xyz, cls, obj_id in zip(transformed_player_loc, player_cls.astype(np.int16), player_id):
                 x,y,_ = xyz
-                color = colors[cls]
-
+                #if class == player send to function to determine which team color
+                if(cls == 0):
+                    color = color_array[find_color(player_box, count, color_list_lab, palette_list, frame)]
+                #if class == ball solve for new speed of ball, currently in pizels per frame, transitioning to mps seems diffcult since frame does not cover entire pitch
+                elif(cls == 2):
+                    color = (255, 255, 255)
+                    speed = (np.sqrt((x - prev_ball_x)**2 + (y - prev_ball_y)**2)) / frames_since_update
+                    frames_since_update = 0
+                    prev_ball_x = x
+                    prev_ball_y = y
+                    cv2.putText(frame, str(speed), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1) #This doesnt work idk why
+                #else class == referee, color == black
+                else:
+                    color = cls_colors[cls]
                 cv2.circle(graph,(int(x),int(y)), 5, color, -1)
                 cv2.putText(graph, str(obj_id), (int(x) - 5, int(y) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.imshow("YOLOv8 Tracking", graph)
+                cv2.rectangle(frame, (int(player_box[count][0]), int(player_box[count][1])), 
+                                    (int(player_box[count][2]), int(player_box[count][3])), (0, 255, 0), 2)
+                count += 1
+                frames_since_update += 1
+            print(speed)
+            cv2.imshow("YOLOv8 Tracking", graph)    
             cv2.imshow("YOLOv8 Tracking reference", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
