@@ -132,6 +132,68 @@ def transform(video_path,graph_path,transform_kp,device):
     cap.release()
     cv2.destroyAllWindows()
 
+
+def transform_to_vid(video_path, graph_path, transform_kp, device):
+    model_p = YOLO("models/Yolo8LP/weights/best.pt")
+    model_f = YOLO("models/Yolo8MF/weights/best.pt")
+    cap = cv2.VideoCapture(video_path)
+    
+    # Get video properties for VideoWriter
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_rate = int(cap.get(cv2.CAP_PROP_FPS))
+    
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')  # You can also use 'MP4V' for .mp4
+    out = cv2.VideoWriter('output_video.avi', fourcc, frame_rate, (frame_width, frame_height))
+    
+    while cap.isOpened():
+        success, frame = cap.read()
+        if success:
+            field_result = model_f.predict(frame)
+            field_result = field_result[0]
+            image_kp_cls = field_result.boxes.cls.cpu().numpy()
+            image_kp_cls = image_kp_cls.astype(np.int32)
+
+            transform_kp_f = transform_kp[image_kp_cls]
+            image_kp = field_result.boxes.xyxy.cpu().numpy()
+            image_kp = np.mean(image_kp.reshape(-1, 2, 2), axis=1)
+            image_kp = image_kp.astype(np.int16)
+            homography, _ = cv2.findHomography(image_kp, transform_kp_f, cv2.RANSAC, 1.0)
+            player_result = model_p.track(frame,persist = True)
+            player_result = player_result[0]
+            player_box = player_result.boxes.xyxy.cpu().numpy()
+            player_cls = player_result.boxes.cls.cpu().numpy() # 0 player, 1 ref, 2 ball
+            player_id = player_result.boxes.id.cpu().numpy()
+            player_xloc = np.mean(player_box[:,[0,2]],axis = 1)
+            player_yloc = np.max(player_box[:,[1,3]], axis = 1)
+            player_loc = np.hstack([np.expand_dims(player_xloc,1),np.expand_dims(player_yloc,1),np.ones_like(np.expand_dims(player_yloc,1))])
+
+            player_coords = player_loc[:, :2]
+            player_coords = player_coords[np.newaxis, ...]  # same as player_coords[np.newaxis]
+            player_points_transformed = cv2.perspectiveTransform(player_coords, homography)
+            player_points_transformed = player_points_transformed[0]
+            graph = cv2.imread(graph_path)
+            transformed_player_loc = np.hstack((player_points_transformed, np.ones((player_points_transformed.shape[0], 1))))
+            colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # Red for players, green for refs, blue for ball
+
+            # Draw transformed player locations and label them
+            for point, cls, pid in zip(player_points_transformed, player_cls.astype(int), player_id.astype(int)):
+                cv2.circle(graph, (int(point[0]), int(point[1])), 5, colors[cls], -1)
+                cv2.putText(graph, f'ID:{pid}', (int(point[0])+10, int(point[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            out.write(graph)
+            
+        else:
+            # Break the loop if the end of the video is reached
+            break
+            
+    # Release everything if job is finished
+    cap.release()
+    out.release()  # Save the output video
+    cv2.destroyAllWindows()
+
+
 if __name__ == '__main__':
     kp = np.load('field_coord.npy')
     transform('dataset/test.mp4','field_graph.jpg',kp,torch.device('cuda'))
