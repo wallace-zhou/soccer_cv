@@ -11,6 +11,7 @@
 *.gif
 *.mp4
 *.avi
+*.pt
 # Executables and debug files
 main
 *.exe
