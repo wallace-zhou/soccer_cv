@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import skimage
+from sklearn.metrics import mean_squared_error
 
 def find_color(player_box, player, color_list_lab, palette_list, frame):
     box = player_box[player]                   
@@ -53,7 +54,7 @@ def find_color(player_box, player, color_list_lab, palette_list, frame):
         players_teams_list = (max(vote, key=vote.count))
     return players_teams_list
 
-def transform(video_path,graph_path,transform_kp,device):
+def transform(video_path,graph_path,transform_kp,device,save):
     model_p = YOLO("models/Yolo8LP/weights/best.pt")
     model_f = YOLO("models/Yolo8MF/weights/best.pt")
     cap = cv2.VideoCapture(video_path)
@@ -61,22 +62,47 @@ def transform(video_path,graph_path,transform_kp,device):
     prev_ball_y = 0
     frames_since_update = 0
     speed = 0
+    image_kp_prev = np.array([])
+    image_kp_cls_prev = []
+    frame_ind = 0
+
+    frame_rate = int(cap.get(cv2.CAP_PROP_FPS))
+    graph = cv2.imread(graph_path)
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'H264')  # You can also use 'MP4V' for .mp4
+    out = cv2.VideoWriter('output_video.mp4', fourcc, frame_rate, (graph.shape[1], graph.shape[0]))
+
     while cap.isOpened():
         success, frame = cap.read()
         if success:
-            
-            field_result = model_f.predict(frame)
+            frame_ind+=1
+            field_result = model_f.predict(frame,conf = 0.5)
             field_result = field_result[0]
             image_kp_cls = field_result.boxes.cls.cpu().numpy()
-            image_kp_cls = image_kp_cls.astype(np.int32)
-
+            image_kp_cls = list(image_kp_cls.astype(np.int32))
+            if(field_result.boxes.shape[0] == 0):
+                break
             transform_kp_f = transform_kp[image_kp_cls]
             image_kp = field_result.boxes.xyxy.cpu().numpy()
             image_kp = np.mean(image_kp.reshape(-1, 2, 2), axis=1)
             image_kp = image_kp.astype(np.int16)
-            homography, _ = cv2.findHomography(image_kp, transform_kp_f, cv2.RANSAC, 8.0)
-
-            player_result = model_p.track(frame,persist = True)
+            if(len(image_kp_cls) > 3):
+                if frame_ind > 1:
+                    common_labels = set(image_kp_cls_prev) & set(image_kp_cls)
+                    if len(common_labels) > 3:
+                        common_label_idx_prev = [image_kp_cls_prev.index(i) for i in common_labels] 
+                        common_label_idx_curr = [image_kp_cls.index(i) for i in common_labels]
+                        error = mean_squared_error(image_kp_prev[common_label_idx_prev],image_kp[common_label_idx_curr])
+                        update_H = error > 10
+                    else:
+                        update_H = True
+                else:
+                    update_H = True
+                if update_H:
+                    homography, _ = cv2.findHomography(image_kp, transform_kp_f)
+                image_kp_prev = image_kp.copy()
+                image_kp_cls_prev = image_kp_cls.copy()
+            player_result = model_p.track(frame,persist = True, conf = 0.60)
             player_result = player_result[0]
             player_box = player_result.boxes.xyxy.cpu().numpy()
             player_cls = player_result.boxes.cls.cpu().numpy() # 0 player, 1 ref, 2 ball
@@ -87,18 +113,25 @@ def transform(video_path,graph_path,transform_kp,device):
             transformed_player_loc = np.dot(homography,player_loc.T).T
             transformed_player_loc /= transformed_player_loc[:, 2][:, np.newaxis]
             graph = cv2.imread(graph_path)
-    
+
+
+            height, width = graph.shape[:2]
+            warped_image = cv2.warpPerspective(frame, homography, (width, height))
             # Define colors for each class
             cls_colors = [(255, 0, 0), (0, 0, 0), (255, 255, 255)]
             colors = {"Chelsea":[(41,71,138), (220,98,88)],
                         "Man City":[(144,200,255), (188,199,3)] #(Players kit color, GK kit color)                
                     }
+            # colors = {"France":[(33, 48, 77), (242, 232, 34)],
+            #             "Croatia":[(255,255,255), (66, 255, 28)] #(Players kit color, GK kit color)                
+            #         }
             colors_list = colors["Chelsea"] + colors["Man City"]
+            # colors_list = colors["France"] + colors["Croatia"]
             color_list_lab = [skimage.color.rgb2lab([i/255 for i in c]) for c in colors_list] 
             color_array = [(138,71,41), (255,200,144)]
             palette_list = []                                                                
             count = 0
-    
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  
             for xyz, cls, obj_id in zip(transformed_player_loc, player_cls.astype(np.int16), player_id):
                 x,y,_ = xyz
                 #if class == player send to function to determine which team color
@@ -107,14 +140,14 @@ def transform(video_path,graph_path,transform_kp,device):
                 #if class == ball solve for new speed of ball, currently in pizels per frame, transitioning to mps seems diffcult since frame does not cover entire pitch
                 elif(cls == 2):
                     color = (255, 255, 255)
-                    speed = (np.sqrt((x - prev_ball_x)**2 + (y - prev_ball_y)**2)) / frames_since_update
+                    speed = (np.sqrt((x - prev_ball_x)**2 + (y - prev_ball_y)**2)) / frames_since_update * 0.15 * frame_rate #0.15 meter per pixel and 30 frame per second
                     frames_since_update = 0
                     prev_ball_x = x
                     prev_ball_y = y
-                    cv2.putText(frame, str(speed), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1) #This doesnt work idk why
                 #else class == referee, color == black
                 else:
                     color = cls_colors[cls]
+                cv2.putText(graph, str(round(speed,2)) + ' m/s', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 cv2.circle(graph,(int(x),int(y)), 5, color, -1)
                 cv2.putText(graph, str(obj_id), (int(x) - 5, int(y) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 cv2.rectangle(frame, (int(player_box[count][0]), int(player_box[count][1])), 
@@ -124,11 +157,20 @@ def transform(video_path,graph_path,transform_kp,device):
             print(speed)
             cv2.imshow("YOLOv8 Tracking", graph)    
             cv2.imshow("YOLOv8 Tracking reference", frame)
+            cv2.imshow("YOLOv8 Tracking reference", warped_image)
+            # key = cv2.waitKey(0) & 0xFF
+            # if key == ord('c'):
+            #     continue
+            # elif key == ord('q'):
+            #     break
+            if(save):
+                out.write(graph)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
         else:
             # Break the loop if the end of the video is reached
             break
+    out.release()
     cap.release()
     cv2.destroyAllWindows()
 
@@ -144,13 +186,14 @@ def transform_to_vid(video_path, graph_path, transform_kp, device):
     frame_rate = int(cap.get(cv2.CAP_PROP_FPS))
     
     # Define the codec and create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')  # You can also use 'MP4V' for .mp4
-    out = cv2.VideoWriter('output_video.avi', fourcc, frame_rate, (frame_width, frame_height))
+    fourcc = cv2.VideoWriter_fourcc(*'H264')  # You can also use 'MP4V' for .mp4
+    out = cv2.VideoWriter('output_video.mp4', fourcc, frame_rate, (frame_width, frame_height))
     
     while cap.isOpened():
         success, frame = cap.read()
         if success:
             field_result = model_f.predict(frame)
+            
             field_result = field_result[0]
             image_kp_cls = field_result.boxes.cls.cpu().numpy()
             image_kp_cls = image_kp_cls.astype(np.int32)
@@ -164,7 +207,7 @@ def transform_to_vid(video_path, graph_path, transform_kp, device):
             player_result = player_result[0]
             player_box = player_result.boxes.xyxy.cpu().numpy()
             player_cls = player_result.boxes.cls.cpu().numpy() # 0 player, 1 ref, 2 ball
-            player_id = player_result.boxes.id.cpu().numpy()
+            player_id = player_result.boxes.id.cpu().numpy() if player_result.boxes.id is not None else None
             player_xloc = np.mean(player_box[:,[0,2]],axis = 1)
             player_yloc = np.max(player_box[:,[1,3]], axis = 1)
             player_loc = np.hstack([np.expand_dims(player_xloc,1),np.expand_dims(player_yloc,1),np.ones_like(np.expand_dims(player_yloc,1))])
@@ -196,7 +239,7 @@ def transform_to_vid(video_path, graph_path, transform_kp, device):
 
 if __name__ == '__main__':
     kp = np.load('field_coord.npy')
-    transform('dataset/test.mp4','field_graph.jpg',kp,torch.device('cuda'))
+    transform('dataset/test.mp4','field_graph.jpg',kp,torch.device('cuda'),True)
     # from collections import defaultdict
 
     # import cv2
